@@ -56,6 +56,83 @@ function safeInt(value) {
   return Number.isFinite(n) ? Math.trunc(n) : 0;
 }
 
+// Supabase uses UUID primary keys. The frontend may generate friendly IDs
+// such as P-..., C-..., S-..., U-... . Convert every incoming frontend ID
+// deterministically to a UUID so the same ID always maps to the same row.
+function toUuid(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return null;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(raw)) {
+    return raw;
+  }
+  const hex = crypto.createHash('sha256').update(raw).digest('hex');
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    '5' + hex.slice(13, 16),
+    ((parseInt(hex.slice(16, 18), 16) & 0x3f) | 0x80).toString(16).padStart(2, '0') + hex.slice(18, 20),
+    hex.slice(20, 32)
+  ].join('-');
+}
+
+function normalizeSyncDb(input) {
+  const db = input && typeof input === 'object' ? input : {};
+
+  const products = (db.products || []).map(p => ({
+    ...p,
+    id: toUuid(p.id)
+  }));
+  const productIdByOriginal = new Map((db.products || []).map((p, i) => [String(p.id ?? ''), products[i].id]));
+
+  const customers = (db.customers || []).map(c => ({
+    ...c,
+    id: toUuid(c.id)
+  }));
+  const suppliers = (db.suppliers || []).map(s => ({
+    ...s,
+    id: toUuid(s.id)
+  }));
+  const expenses = (db.expenses || []).map(e => ({
+    ...e,
+    id: toUuid(e.id)
+  }));
+  const users = (db.users || []).map(u => ({
+    ...u,
+    id: toUuid(u.id)
+  }));
+
+  const sales = (db.sales || []).map(s => ({
+    ...s,
+    id: toUuid(s.id),
+    customerId: s.customerId ? toUuid(s.customerId) : '',
+    items: Array.isArray(s.items) ? s.items.map(item => ({
+      ...item,
+      id: item.id ? (productIdByOriginal.get(String(item.id)) || toUuid(item.id)) : null
+    })) : []
+  }));
+
+  const saleIdByOriginal = new Map((db.sales || []).map((s, i) => [String(s.id ?? ''), sales[i].id]));
+  const customerIdByOriginal = new Map((db.customers || []).map((c, i) => [String(c.id ?? ''), customers[i].id]));
+
+  const payments = (db.payments || []).map(p => ({
+    ...p,
+    id: toUuid(p.id),
+    saleId: p.saleId ? (saleIdByOriginal.get(String(p.saleId)) || toUuid(p.saleId)) : null,
+    customerId: p.customerId ? (customerIdByOriginal.get(String(p.customerId)) || toUuid(p.customerId)) : null
+  }));
+
+  return {
+    ...db,
+    products,
+    customers,
+    suppliers,
+    expenses,
+    users,
+    sales,
+    payments
+  };
+}
+
 async function ensureBranch(client) {
   const r = await client.query(`SELECT id FROM branches ORDER BY created_at NULLS LAST LIMIT 1`);
   if (r.rows[0]) return r.rows[0].id;
@@ -101,33 +178,13 @@ function toFrontendUser(u) {
   };
 }
 
-async function ensurePurchasesTable(client) {
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS public.purchases (
-      id uuid PRIMARY KEY,
-      branch_id uuid REFERENCES public.branches(id) ON DELETE SET NULL,
-      number varchar(100) NOT NULL UNIQUE,
-      purchase_date timestamptz NOT NULL DEFAULT now(),
-      supplier_id uuid,
-      supplier_name varchar(255),
-      currency varchar(20) NOT NULL DEFAULT 'UGX',
-      total numeric(14,2) NOT NULL DEFAULT 0,
-      items jsonb NOT NULL DEFAULT '[]'::jsonb,
-      notes text,
-      created_at timestamptz NOT NULL DEFAULT now(),
-      updated_at timestamptz NOT NULL DEFAULT now()
-    )
-  `);
-}
-
 async function bootstrap() {
   const client = await pool.connect();
   try {
     const branchId = await ensureBranch(client);
     await ensureAdmin(client, branchId);
-    await ensurePurchasesTable(client);
 
-    const [products, customers, suppliers, expenses, users, settings, sales, saleItems, payments, purchases] = await Promise.all([
+    const [products, customers, suppliers, expenses, users, settings, sales, saleItems, payments] = await Promise.all([
       client.query(`SELECT * FROM products ORDER BY created_at DESC`),
       client.query(`SELECT * FROM customers ORDER BY created_at DESC`),
       client.query(`SELECT * FROM suppliers ORDER BY created_at DESC`),
@@ -136,8 +193,7 @@ async function bootstrap() {
       client.query(`SELECT * FROM settings ORDER BY created_at DESC LIMIT 1`),
       client.query(`SELECT * FROM sales ORDER BY created_at DESC`),
       client.query(`SELECT * FROM sale_items ORDER BY created_at ASC`),
-      client.query(`SELECT * FROM payments ORDER BY payment_date DESC, created_at DESC`),
-      client.query(`SELECT * FROM public.purchases WHERE branch_id = $1 ORDER BY purchase_date DESC, created_at DESC`, [branchId])
+      client.query(`SELECT * FROM payments ORDER BY payment_date DESC, created_at DESC`)
     ]);
 
     const customerMap = new Map(customers.rows.map(c => [c.id, c]));
@@ -218,12 +274,6 @@ async function bootstrap() {
         id: s.id, name: s.name, company: s.company_name || "", phone: s.phone || "",
         whatsapp: s.whatsapp || "", email: s.email || "", notes: s.notes || ""
       })),
-      purchases: purchases.rows.map(p => ({
-        id: p.id, number: p.number, date: p.purchase_date,
-        supplierId: p.supplier_id || "", supplierName: p.supplier_name || "",
-        currency: safeCurrency(p.currency, 'UGX'), total: Number(p.total || 0),
-        items: Array.isArray(p.items) ? p.items : [], notes: p.notes || ""
-      })),
       expenses: expenses.rows.map(e => ({
         id: e.id, date: e.expense_date, type: e.category || e.title || "أخرى",
         amount: Number(e.amount || 0), currency: safeCurrency(e.currency, 'UGX'), description: e.description || ""
@@ -254,11 +304,11 @@ async function upsert(client, table, data) {
 }
 
 async function syncDB(db) {
+  db = normalizeSyncDb(db);
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     const branchId = await ensureBranch(client);
-    await ensurePurchasesTable(client);
     const admin = await ensureAdmin(client, branchId);
     const now = new Date().toISOString();
 
@@ -288,32 +338,6 @@ async function syncDB(db) {
       });
     }
 
-    const incomingPurchases = Array.isArray(db.purchases) ? db.purchases : [];
-    if (incomingPurchases.length === 0) {
-      await client.query(`DELETE FROM public.purchases WHERE branch_id = $1`, [branchId]);
-    } else {
-      const ids = incomingPurchases.map(x => x?.id).filter(Boolean);
-      if (ids.length) {
-        await client.query(`DELETE FROM public.purchases WHERE branch_id = $1 AND NOT (id = ANY($2::uuid[]))`, [branchId, ids]);
-      }
-      for (const p of incomingPurchases) {
-        if (!p?.id) continue;
-        await upsert(client, "purchases", {
-          id: p.id,
-          branch_id: branchId,
-          number: String(p.number || `PUR-${String(p.id).slice(0,8)}`),
-          purchase_date: safeDate(p.date, now),
-          supplier_id: p.supplierId || null,
-          supplier_name: p.supplierName || null,
-          currency: safeCurrency(p.currency, 'UGX'),
-          total: safeMoney(p.total),
-          items: JSON.stringify(Array.isArray(p.items) ? p.items : []),
-          notes: p.notes || null,
-          updated_at: now
-        });
-      }
-    }
-
     for (const e of (db.expenses || [])) {
       await upsert(client, "expenses", {
         id: e.id, branch_id: branchId, created_by: admin.id, title: e.type || "أخرى",
@@ -324,7 +348,7 @@ async function syncDB(db) {
     }
 
     for (const u of (db.users || [])) {
-      if (!u.id) continue;
+      if (!u.id || String(u.username || '').toLowerCase() === 'admin') continue;
       await upsert(client, "users", {
         id: u.id, branch_id: branchId, name: u.name, username: u.username,
         email: null, phone: u.phone || null, password_hash: u.password || "",
@@ -428,7 +452,6 @@ async function syncDB(db) {
             `SELECT id FROM stock_movements
              WHERE product_id = $1
                AND reference_id = $2
-               AND reference_type = 'sale'
              LIMIT 1`,
             [productId, s.id]
           );
@@ -442,9 +465,9 @@ async function syncDB(db) {
             await client.query(`
               INSERT INTO stock_movements
                 (id, product_id, branch_id, user_id, movement_type, quantity,
-                 previous_quantity, new_quantity, reference_id, reference_type, notes)
+                 previous_quantity, new_quantity, reference_id, notes)
               VALUES
-                ($1, $2, $3, $4, 'sale', $5, $6, $7, $8, 'sale', $9)
+                ($1, $2, $3, $4, 'sale', $5, $6, $7, $8, $9)
             `, [
               crypto.randomUUID(),
               productId,
@@ -482,6 +505,148 @@ async function syncDB(db) {
         payment_date: paymentDate,
         currency: paymentCurrency
       });
+    }
+
+    // Create/update installment schedules.
+    // The current Supabase installments table has no branch_id column.
+    // We therefore use only columns that actually exist in the table.
+    for (const s of (db.sales || [])) {
+      if (!s?.id || (s.type !== "installment" && safeMoney(s.remaining) <= 0)) continue;
+
+      const count = Math.max(1, Math.min(120, safeInt(s.installmentCount) || 1));
+      const customerId = s.customerId || null;
+      if (!customerId) {
+        console.warn(`Skipping installment schedule for sale ${s.id}: no customer_id`);
+        continue;
+      }
+
+      const saleRemaining = Math.max(0, safeMoney(s.remaining));
+      if (saleRemaining <= 0) continue;
+
+      const currency = safeCurrency(s.currency, safeCurrency(db.settings?.currency, 'UGX'));
+
+      const installmentColsResult = await client.query(`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'installments'
+      `);
+      const installmentColumns = new Set(
+        installmentColsResult.rows.map(r => String(r.column_name))
+      );
+
+      const existing = await client.query(
+        `SELECT * FROM installments WHERE sale_id = $1 ORDER BY installment_number ASC`,
+        [s.id]
+      );
+      const existingByNumber = new Map(
+        existing.rows.map(r => [Number(r.installment_number), r])
+      );
+
+      const existingScheduledTotal = existing.rows.reduce(
+        (sum, r) => sum + safeMoney(r.amount), 0
+      );
+      const scheduledTotal =
+        existingScheduledTotal > 0 ? existingScheduledTotal : saleRemaining;
+
+      const installmentAmount =
+        Math.max(0, safeMoney(s.installmentAmount)) ||
+        (scheduledTotal / count);
+
+      const baseDueDate = new Date(s.firstDue || s.dueDate || s.date || now);
+      if (Number.isNaN(baseDueDate.getTime())) {
+        baseDueDate.setTime(new Date(now).getTime());
+      }
+      if (!s.firstDue && !s.dueDate) {
+        baseDueDate.setMonth(baseDueDate.getMonth() + 1);
+      }
+
+      const paymentTotals = await client.query(
+        `SELECT COALESCE(SUM(amount),0) AS total_paid,
+                MAX(payment_date) AS last_payment_date
+         FROM payments WHERE sale_id = $1`,
+        [s.id]
+      );
+
+      let scheduledPaid = Math.max(0, scheduledTotal - saleRemaining);
+      const lastPaymentDate =
+        paymentTotals.rows[0]?.last_payment_date || null;
+
+      for (let i = 1; i <= count; i++) {
+        const amount =
+          i === count
+            ? Math.max(0, scheduledTotal - installmentAmount * (count - 1))
+            : installmentAmount;
+
+        const paidAmount = Math.min(amount, scheduledPaid);
+        scheduledPaid = Math.max(0, scheduledPaid - paidAmount);
+        const remainingAmount = Math.max(0, amount - paidAmount);
+
+        const due = new Date(baseDueDate);
+        const period = String(s.period || "monthly").toLowerCase();
+        if (period === "weekly") due.setDate(due.getDate() + 7 * (i - 1));
+        else if (period === "daily") due.setDate(due.getDate() + (i - 1));
+        else due.setMonth(due.getMonth() + (i - 1));
+
+        const status =
+          remainingAmount <= 0 ? "paid" :
+          paidAmount > 0 ? "partial" : "pending";
+
+        const valuesByColumn = {
+          sale_id: s.id,
+          customer_id: customerId,
+          installment_number: i,
+          amount,
+          paid_amount: paidAmount,
+          remaining_amount: remainingAmount,
+          paid_date: paidAmount > 0 ? lastPaymentDate : null,
+          due_date: due.toISOString(),
+          status,
+          currency,
+          notes: `Installment ${i}/${count} - ${s.invoice || s.id}`,
+          created_at: now,
+          updated_at: now
+        };
+
+        const data = {};
+        for (const [key, value] of Object.entries(valuesByColumn)) {
+          if (installmentColumns.has(key)) data[key] = value;
+        }
+
+        const row = existingByNumber.get(i);
+
+        if (row?.id) {
+          const keys = Object.keys(data);
+          if (keys.length) {
+            const vals = keys.map(k => data[k]);
+            vals.push(row.id);
+            const set = keys
+              .map((k, idx) => `${qi(k)} = $${idx + 1}`)
+              .join(", ");
+            await client.query(
+              `UPDATE installments SET ${set} WHERE id = $${vals.length}`,
+              vals
+            );
+          }
+        } else {
+          data.id = crypto.randomUUID();
+          const keys = Object.keys(data);
+          const vals = keys.map(k => data[k]);
+          await client.query(
+            `INSERT INTO installments (${keys.map(qi).join(", ")})
+             VALUES (${keys.map((_, idx) => `$${idx + 1}`).join(", ")})`,
+            vals
+          );
+        }
+      }
+
+      if (existing.rows.length > count) {
+        await client.query(
+          `DELETE FROM installments
+           WHERE sale_id = $1 AND installment_number > $2`,
+          [s.id, count]
+        );
+      }
     }
 
     await client.query("COMMIT");
