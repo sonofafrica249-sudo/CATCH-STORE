@@ -23,7 +23,7 @@ app.use(cors());
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
 
-const rendererPath = path.join(__dirname, "../src/renderer");
+const rendererPath = __dirname;
 app.use(express.static(rendererPath));
 app.get("/", (req, res) => res.sendFile(path.join(rendererPath, "index.html")));
 
