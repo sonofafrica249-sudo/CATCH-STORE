@@ -310,6 +310,32 @@ async function syncDB(db) {
     await client.query("BEGIN");
     const branchId = await ensureBranch(client);
     const admin = await ensureAdmin(client, branchId);
+
+    // The admin account is managed by the existing Supabase row.
+    // Never create a second admin row from the frontend-generated ID.
+    // When the administrator changes the password in the app, persist the
+    // new password directly to the real admin row so it survives reloads,
+    // new devices, and Render restarts.
+    const frontendAdmin = (db.users || []).find(
+      u => String(u.username || '').trim().toLowerCase() === 'admin'
+    );
+    if (frontendAdmin) {
+      await client.query(`
+        UPDATE users
+        SET name = $1, phone = $2, password_hash = $3,
+            role = 'admin', is_active = $4, branch_id = $5, updated_at = $6
+        WHERE id = $7
+      `, [
+        frontendAdmin.name || 'المدير',
+        frontendAdmin.phone || null,
+        String(frontendAdmin.password ?? ''),
+        frontendAdmin.status !== 'Inactive',
+        branchId,
+        new Date().toISOString(),
+        admin.id
+      ]);
+    }
+
     const now = new Date().toISOString();
 
     for (const p of (db.products || [])) {
